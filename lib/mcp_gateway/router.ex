@@ -11,7 +11,7 @@ defmodule McpGateway.Router do
   plug :match
   plug :dispatch
 
-  post "/mcp" do
+  post "/mcp2" do
     Logger.info("MCP POST: #{inspect(conn.body_params)}")
 
     case McpGateway.RpcClient.call(conn.body_params) do
