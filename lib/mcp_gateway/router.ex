@@ -66,6 +66,47 @@ defmodule McpGateway.Router do
     end
   end
 
+
+
+get "/blob/:token" do
+  token = conn.path_params["token"]
+  Logger.info("Blob request: #{token}")
+
+  case McpGateway.RpcClient.call(%{
+         "jsonrpc" => "2.0",
+         "id" => System.unique_integer([:positive]),
+         "method" => "read_file_blob",
+         "params" => %{"token" => token}
+       }) do
+    {:ok, %{"result" => %{"data" => b64, "path" => path}}} ->
+      case Base.decode64(b64) do
+        {:ok, bytes} ->
+          filename = Path.basename(path)
+
+          conn
+          |> put_resp_content_type("application/octet-stream")
+          |> put_resp_header("content-disposition",
+               ~s(attachment; filename="#{filename}"))
+          |> put_resp_header("content-length", to_string(byte_size(bytes)))
+          |> put_resp_header("x-accel-buffering", "no")
+          |> send_resp(200, bytes)
+
+        :error ->
+          send_resp(conn, 500, "Invalid base64 from worker")
+      end
+
+    {:ok, %{"error" => err}} ->
+      conn
+      |> put_resp_content_type("application/json")
+      |> send_resp(404, Jason.encode!(err))
+
+    {:error, reason} ->
+      Logger.error("Blob RPC error: #{inspect(reason)}")
+      send_resp(conn, 502, "RPC error: #{inspect(reason)}")
+  end
+end
+
+
   # ------------------------------------------------------------------
   # GET /mcp — SSE-эндпоинт для долгоживущих соединений
   # ------------------------------------------------------------------

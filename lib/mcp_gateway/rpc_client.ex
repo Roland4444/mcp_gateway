@@ -23,7 +23,9 @@ defmodule McpGateway.RpcClient do
   def call(payload) do
     amqp_url = Application.get_env(:mcp_gateway, :amqp_url)
     queue = Application.get_env(:mcp_gateway, :request_queue)
-    timeout = Application.get_env(:mcp_gateway, :rpc_timeout_ms, @default_timeout)
+    timeout = Application.get_env(:mcp_gateway, :rpc_timeout_ms, 30_000)
+
+   ## timeout = Application.get_env(:mcp_gateway, :rpc_timeout_ms, @default_timeout)
 
     unless amqp_url do
       raise "Не задан :amqp_url в config/config.exs"
