@@ -1,5 +1,5 @@
 #  simple
-
+#  simple
 defmodule McpGateway.Application do
   @moduledoc false
   use Application
