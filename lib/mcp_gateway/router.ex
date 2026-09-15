@@ -14,58 +14,34 @@ defmodule McpGateway.Router do
   # ------------------------------------------------------------------
   # POST /mcp — основной обработчик JSON-RPC
   # ------------------------------------------------------------------
-  post "/mcp" do
-    Logger.info("MCP POST: #{inspect(conn.body_params)}")
+post "/mcp" do
+  Logger.info("MCP POST: #{inspect(conn.body_params)}")
 
-    # Проверяем, хочет ли клиент SSE
-    accept = get_req_header(conn, "accept") |> List.first() || ""
-    wants_sse = String.contains?(accept, "text/event-stream")
+  case McpGateway.RpcClient.call(conn.body_params) do
+    {:ok, response} ->
+      body = Jason.encode!(response)
 
-    case McpGateway.RpcClient.call(conn.body_params) do
-      {:ok, response} ->
-        body = Jason.encode!(response)
+      conn
+      |> put_resp_header("content-type", "application/json")   # без charset
+      |> delete_resp_header("cache-control")                    # убираем кэш
+      |> send_resp(200, body)
 
-        if wants_sse do
-          # Отвечаем SSE-потоком (Streamable HTTP transport)
-          conn
-          |> put_resp_content_type("text/event-stream")
-          |> put_resp_header("cache-control", "no-cache")
-          |> put_resp_header("connection", "keep-alive")
-          |> put_resp_header("x-accel-buffering", "no")
-          |> send_chunked(200)
-          |> send_sse_event(body)
-        else
-          # Отвечаем простым JSON (curl-совместимо)
-          conn
-          |> put_resp_content_type("application/json")
-          |> send_resp(200, body)
-        end
+    {:error, reason} ->
+      Logger.error("RPC error: #{inspect(reason)}")
 
-      {:error, reason} ->
-        Logger.error("RPC error: #{inspect(reason)}")
+      error_body =
+        Jason.encode!(%{
+          jsonrpc: "2.0",
+          id: conn.body_params["id"],
+          error: %{code: -32000, message: "RPC error: #{inspect(reason)}"}
+        })
 
-        error_body =
-          Jason.encode!(%{
-            jsonrpc: "2.0",
-            id: conn.body_params["id"],
-            error: %{code: -32000, message: "RPC error: #{inspect(reason)}"}
-          })
-
-        if wants_sse do
-          conn
-          |> put_resp_content_type("text/event-stream")
-          |> put_resp_header("cache-control", "no-cache")
-          |> put_resp_header("x-accel-buffering", "no")
-          |> send_chunked(200)
-          |> send_sse_event(error_body)
-        else
-          conn
-          |> put_resp_content_type("application/json")
-          |> send_resp(500, error_body)
-        end
-    end
+      conn
+      |> put_resp_header("content-type", "application/json")
+      |> delete_resp_header("cache-control")
+      |> send_resp(500, error_body)
   end
-
+end
 
 
 get "/blob/:token" do
