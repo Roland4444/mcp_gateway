@@ -1,137 +1,100 @@
-defmodule McpGateway.RpcClient do
-  @moduledoc """
-  RPC-клиент для MCP-шлюза.
-
-  Публикует JSON-RPC запрос в очередь RabbitMQ `mcp_requests`
-  и ждёт ответ в эксклюзивной очереди ответа. Ответ сопоставляется
-  с исходным запросом по `correlation_id`.
-
-  Использует AMQPS (TLS) для подключения к RabbitMQ.
-  """
+defmodule McpGateway.Router do
+  use Plug.Router
 
   require Logger
 
-  @default_timeout 30_000
+  plug Plug.Parsers,
+    parsers: [:json],
+    pass: ["application/json"],
+    json_decoder: Jason
 
-  @doc """
-  Отправляет запрос `payload` (map) в RabbitMQ и ждёт ответ.
+  plug :match
+  plug :dispatch
 
-  Возвращает:
-    * `{:ok, response_map}` при успехе
-    * `{:error, reason}` при ошибке соединения, таймауте или невалидном JSON
-  """
-  def call(payload) do
-    amqp_url = Application.get_env(:mcp_gateway, :amqp_url)
-    queue = Application.get_env(:mcp_gateway, :request_queue)
-    timeout = Application.get_env(:mcp_gateway, :rpc_timeout_ms, 30_000)
+  # ------------------------------------------------------------------
+  # POST /mcp — единственный MCP-эндпоинт
+  # ------------------------------------------------------------------
+  post "/mcp" do
+    Logger.info("MCP POST: #{inspect(conn.body_params)}")
 
-   ## timeout = Application.get_env(:mcp_gateway, :rpc_timeout_ms, @default_timeout)
+    case McpGateway.RpcClient.call(conn.body_params) do
+      {:ok, response} ->
+        body = Jason.encode!(response)
 
-    unless amqp_url do
-      raise "Не задан :amqp_url в config/config.exs"
-    end
-
-    unless queue do
-      raise "Не задан :request_queue в config/config.exs"
-    end
-
-    case AMQP.Connection.open(amqp_url, ssl_options: ssl_opts()) do
-      {:ok, conn} ->
-        try do
-          {:ok, chan} = AMQP.Channel.open(conn)
-          do_rpc(chan, queue, payload, timeout)
-        after
-          AMQP.Connection.close(conn)
-        end
+        conn
+        |> put_resp_header("content-type", "application/json")
+        |> delete_resp_header("cache-control")
+        |> send_resp(200, body)
 
       {:error, reason} ->
-        Logger.error("RabbitMQ connection failed: #{inspect(reason)}")
-        {:error, {:connection_failed, reason}}
+        Logger.error("RPC error: #{inspect(reason)}")
+
+        error_body =
+          Jason.encode!(%{
+            jsonrpc: "2.0",
+            id: conn.body_params["id"],
+            error: %{code: -32000, message: "RPC error: #{inspect(reason)}"}
+          })
+
+        conn
+        |> put_resp_header("content-type", "application/json")
+        |> delete_resp_header("cache-control")
+        |> send_resp(500, error_body)
     end
   end
 
   # ------------------------------------------------------------------
-  # Внутренние функции
+  # GET /blob/:token — скачивание файлов
   # ------------------------------------------------------------------
+  get "/blob/:token" do
+    token = conn.path_params["token"]
+    Logger.info("Blob request: #{token}")
 
-  defp do_rpc(chan, queue, payload, timeout) do
-    # Эксклюзивная временная очередь для ответа.
-    # Она удалится автоматически при закрытии соединения.
-    {:ok, %{queue: reply_queue}} = AMQP.Queue.declare(chan, "", exclusive: true)
+    case McpGateway.RpcClient.call(%{
+           "jsonrpc" => "2.0",
+           "id" => System.unique_integer([:positive]),
+           "method" => "read_file_blob",
+           "params" => %{"token" => token}
+         }) do
+      {:ok, %{"result" => %{"data" => b64, "path" => path}}} ->
+        case Base.decode64(b64) do
+          {:ok, bytes} ->
+            filename = Path.basename(path)
 
-    # Уникальный ID для сопоставления запроса и ответа.
-    correlation_id = generate_correlation_id()
+            conn
+            |> put_resp_header("content-type", "application/octet-stream")
+            |> put_resp_header("content-disposition",
+                 ~s(attachment; filename="#{filename}"))
+            |> put_resp_header("content-length", to_string(byte_size(bytes)))
+            |> put_resp_header("x-accel-buffering", "no")
+            |> send_resp(200, bytes)
 
-    payload_json = Jason.encode!(payload)
-
-    Logger.debug("Publishing to #{queue} (corr_id=#{correlation_id})")
-
-    AMQP.Basic.publish(chan, "", queue, payload_json,
-      reply_to: reply_queue,
-      correlation_id: correlation_id,
-      content_type: "application/json",
-      delivery_mode: 2
-    )
-
-    # Слушаем очередь ответа.
-    AMQP.Basic.consume(chan, reply_queue, nil, no_ack: true)
-
-    receive do
-      {:basic_deliver, body, %{correlation_id: ^correlation_id}} ->
-        Logger.debug("Got reply (corr_id=#{correlation_id})")
-
-        case Jason.decode(body) do
-          {:ok, decoded} ->
-            {:ok, decoded}
-
-          {:error, err} ->
-            Logger.error("Invalid JSON in reply: #{inspect(err)}; body=#{body}")
-            {:error, {:invalid_json, err, body}}
+          :error ->
+            send_resp(conn, 500, "Invalid base64 from worker")
         end
 
-      # Ответ с другим correlation_id — игнорируем, ждём свой.
-      {:basic_deliver, _body, _meta} ->
-        do_rpc_wait(chan, timeout, correlation_id)
-    after
-      timeout ->
-        Logger.error("RPC timeout after #{timeout} ms (corr_id=#{correlation_id})")
-        {:error, :timeout}
+      {:ok, %{"error" => err}} ->
+        conn
+        |> put_resp_header("content-type", "application/json")
+        |> send_resp(404, Jason.encode!(err))
+
+      {:error, reason} ->
+        Logger.error("Blob RPC error: #{inspect(reason)}")
+        send_resp(conn, 502, "RPC error: #{inspect(reason)}")
     end
   end
 
-  # Продолжение ожидания — на случай, если пришёл чужой ответ.
-  defp do_rpc_wait(_chan, timeout, correlation_id) do
-    receive do
-      {:basic_deliver, body, %{correlation_id: ^correlation_id}} ->
-        case Jason.decode(body) do
-          {:ok, decoded} -> {:ok, decoded}
-          {:error, err} -> {:error, {:invalid_json, err, body}}
-        end
-
-      {:basic_deliver, _body, _meta} ->
-        do_rpc_wait(nil, timeout, correlation_id)
-    after
-      timeout ->
-        {:error, :timeout}
-    end
+  # ------------------------------------------------------------------
+  # Healthcheck
+  # ------------------------------------------------------------------
+  get "/health" do
+    send_resp(conn, 200, "OK")
   end
 
-  # 16 случайных байт → hex (32 символа) — почти гарантированно уникально.
-  defp generate_correlation_id do
-    :crypto.strong_rand_bytes(16)
-    |> Base.encode16(case: :lower)
-  end
-
-  # TLS-опции для AMQPS.
-  #
-  # verify: :verify_none — отключает проверку сертификата (аналог `:insecure t`
-  # в Lisp/Dexador). Для production замените на :verify_peer с указанием
-  # cacertfile: "/etc/ssl/certs/ca-certificates.crt" и
-  # server_name_indication: 'romach.space'.
-  defp ssl_opts do
-    [
-      verify: :verify_none,
-      versions: [:"tlsv1.2", :"tlsv1.3"]
-    ]
+  # ------------------------------------------------------------------
+  # Fallback
+  # ------------------------------------------------------------------
+  match _ do
+    send_resp(conn, 404, "Not Found")
   end
 end
