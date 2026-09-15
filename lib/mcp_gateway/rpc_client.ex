@@ -1,100 +1,83 @@
-defmodule McpGateway.Router do
-  use Plug.Router
+defmodule McpGateway.RpcClient do
+  @moduledoc "Публикует MCP-запрос в RabbitMQ и ждёт ответ."
 
   require Logger
 
-  plug Plug.Parsers,
-    parsers: [:json],
-    pass: ["application/json"],
-    json_decoder: Jason
+  def call(payload) do
+    amqp_url = Application.get_env(:mcp_gateway, :amqp_url)
+    queue = Application.get_env(:mcp_gateway, :request_queue)
+    timeout = Application.get_env(:mcp_gateway, :rpc_timeout_ms, 120_000)
 
-  plug :match
-  plug :dispatch
-
-  # ------------------------------------------------------------------
-  # POST /mcp — единственный MCP-эндпоинт
-  # ------------------------------------------------------------------
-  post "/mcp" do
-    Logger.info("MCP POST: #{inspect(conn.body_params)}")
-
-    case McpGateway.RpcClient.call(conn.body_params) do
-      {:ok, response} ->
-        body = Jason.encode!(response)
-
-        conn
-        |> put_resp_header("content-type", "application/json")
-        |> delete_resp_header("cache-control")
-        |> send_resp(200, body)
-
-      {:error, reason} ->
-        Logger.error("RPC error: #{inspect(reason)}")
-
-        error_body =
-          Jason.encode!(%{
-            jsonrpc: "2.0",
-            id: conn.body_params["id"],
-            error: %{code: -32000, message: "RPC error: #{inspect(reason)}"}
-          })
-
-        conn
-        |> put_resp_header("content-type", "application/json")
-        |> delete_resp_header("cache-control")
-        |> send_resp(500, error_body)
-    end
-  end
-
-  # ------------------------------------------------------------------
-  # GET /blob/:token — скачивание файлов
-  # ------------------------------------------------------------------
-  get "/blob/:token" do
-    token = conn.path_params["token"]
-    Logger.info("Blob request: #{token}")
-
-    case McpGateway.RpcClient.call(%{
-           "jsonrpc" => "2.0",
-           "id" => System.unique_integer([:positive]),
-           "method" => "read_file_blob",
-           "params" => %{"token" => token}
-         }) do
-      {:ok, %{"result" => %{"data" => b64, "path" => path}}} ->
-        case Base.decode64(b64) do
-          {:ok, bytes} ->
-            filename = Path.basename(path)
-
-            conn
-            |> put_resp_header("content-type", "application/octet-stream")
-            |> put_resp_header("content-disposition",
-                 ~s(attachment; filename="#{filename}"))
-            |> put_resp_header("content-length", to_string(byte_size(bytes)))
-            |> put_resp_header("x-accel-buffering", "no")
-            |> send_resp(200, bytes)
-
-          :error ->
-            send_resp(conn, 500, "Invalid base64 from worker")
+    case AMQP.Connection.open(amqp_url, ssl_options: ssl_opts()) do
+      {:ok, conn} ->
+        try do
+          {:ok, chan} = AMQP.Channel.open(conn)
+          do_rpc(chan, queue, payload, timeout)
+        after
+          AMQP.Connection.close(conn)
         end
 
-      {:ok, %{"error" => err}} ->
-        conn
-        |> put_resp_header("content-type", "application/json")
-        |> send_resp(404, Jason.encode!(err))
-
       {:error, reason} ->
-        Logger.error("Blob RPC error: #{inspect(reason)}")
-        send_resp(conn, 502, "RPC error: #{inspect(reason)}")
+        Logger.error("RabbitMQ connection failed: #{inspect(reason)}")
+        {:error, {:connection_failed, reason}}
     end
   end
 
-  # ------------------------------------------------------------------
-  # Healthcheck
-  # ------------------------------------------------------------------
-  get "/health" do
-    send_resp(conn, 200, "OK")
+  defp do_rpc(chan, queue, payload, timeout) do
+    {:ok, %{queue: reply_queue}} = AMQP.Queue.declare(chan, "", exclusive: true)
+
+    correlation_id = :crypto.strong_rand_bytes(16) |> Base.encode16(case: :lower)
+    payload_json = Jason.encode!(payload)
+
+    Logger.debug("Publishing to #{queue} (corr_id=#{correlation_id})")
+
+    AMQP.Basic.publish(chan, "", queue, payload_json,
+      reply_to: reply_queue,
+      correlation_id: correlation_id,
+      content_type: "application/json",
+      delivery_mode: 2
+    )
+
+    AMQP.Basic.consume(chan, reply_queue, nil, no_ack: true)
+
+    receive do
+      {:basic_deliver, body, %{correlation_id: ^correlation_id}} ->
+        Logger.debug("Got reply (corr_id=#{correlation_id})")
+
+        case Jason.decode(body) do
+          {:ok, decoded} -> {:ok, decoded}
+          {:error, err} -> {:error, {:invalid_json, err, body}}
+        end
+
+      {:basic_deliver, _body, _meta} ->
+        do_rpc_wait(chan, timeout, correlation_id)
+    after
+      timeout ->
+        Logger.error("RPC timeout after #{timeout} ms (corr_id=#{correlation_id})")
+        {:error, :timeout}
+    end
   end
 
-  # ------------------------------------------------------------------
-  # Fallback
-  # ------------------------------------------------------------------
-  match _ do
-    send_resp(conn, 404, "Not Found")
+  defp do_rpc_wait(_chan, timeout, correlation_id) do
+    receive do
+      {:basic_deliver, body, %{correlation_id: ^correlation_id}} ->
+        case Jason.decode(body) do
+          {:ok, decoded} -> {:ok, decoded}
+          {:error, err} -> {:error, {:invalid_json, err, body}}
+        end
+
+      {:basic_deliver, _body, _meta} ->
+        do_rpc_wait(nil, timeout, correlation_id)
+    after
+      timeout ->
+        {:error, :timeout}
+    end
+  end
+
+  defp ssl_opts do
+    [
+      verify: :verify_none,
+      versions: [:"tlsv1.2", :"tlsv1.3"]
+    ]
   end
 end
